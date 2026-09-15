@@ -1,0 +1,19 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    uses: cjgl23/github-workflows/.github/workflows/security.yml@b25f7e44fd55ce5efd4c57175557e00789d64070
