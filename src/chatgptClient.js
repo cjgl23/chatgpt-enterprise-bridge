@@ -157,9 +157,26 @@ const STUCK_QUIET_MS = Number(process.env.CHATGPT_STUCK_QUIET_MS || 20000);
 
 const COMPOSER_SELECTOR = '#prompt-textarea, form div[contenteditable="true"]';
 const LOGIN_SELECTOR = '[data-testid="login-button"], [data-testid="welcome-login-button"], button:has-text("Log in")';
-const SEND_SELECTOR = '[data-testid="send-button"], button[aria-label="Send prompt"]';
+const SEND_SELECTOR = '[data-testid="send-button"], button[aria-label="Send prompt"], form[data-chatgpt-composer] button[type="submit"][aria-label="Send"]';
 const STOP_SELECTOR = '[data-testid="stop-button"], button[aria-label="Stop streaming"], button[aria-label*="Stop"]';
-const ASSISTANT_MSG_SELECTOR = '[data-message-author-role="assistant"]';
+// The current ChatGPT UI (2026-09) uses search-unit keys instead of the old
+// author-role attribute. Keep both selectors so saved conversations and older
+// UI variants still work.
+const ASSISTANT_MSG_SELECTOR = '[data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"]';
+
+function assistantMessageText(message) {
+  // The search unit includes a visible "ChatGPT said:" label. Return only the
+  // reply body, which callers may parse as JSON. Legacy messages have no
+  // markdown-text-style descendant and retain their original innerText.
+  const markdown = message.querySelectorAll('[data-markdown-text-style="assistant-message"]');
+  if (markdown.length) return Array.from(markdown, el => el.innerText || '').join('\n').trim();
+  if (message.hasAttribute('data-chatgpt-search-unit-key')) return '';
+  return (message.innerText || '').trim();
+}
+
+async function lastAssistantMessageText(messages) {
+  return messages.last().evaluate(assistantMessageText).catch(() => '');
+}
 // Confirmed in production (2026-09): the composer's "Add files and more"
 // button (`data-testid="composer-plus-btn"`) ALSO carries `aria-haspopup="menu"`
 // and sits earlier in DOM order than the reasoning-tier picker button — so a
@@ -197,11 +214,15 @@ async function capturePageDiagnostics(page) {
   const diag = await page.evaluate((selector) => {
     const assistantEls = document.querySelectorAll(selector);
     const last = assistantEls[assistantEls.length - 1];
+    const markdown = last?.querySelectorAll('[data-markdown-text-style="assistant-message"]') || [];
+    const lastText = markdown.length
+      ? Array.from(markdown, el => el.innerText || '').join('\n').trim()
+      : last?.hasAttribute('data-chatgpt-search-unit-key') ? '' : (last?.innerText || '').trim();
     return {
       title: document.title,
       bodySnippet: (document.body && document.body.innerText || '').trim().slice(0, 500),
       assistantMessageCount: assistantEls.length,
-      lastAssistantMessage: last ? (last.innerText || '').trim().slice(0, 1500) : null,
+      lastAssistantMessage: last ? lastText.slice(0, 1500) : null,
     };
   }, ASSISTANT_MSG_SELECTOR).catch(err => ({ evalError: (err && err.message) || String(err) }));
   return { url: page.url(), ...diag };
@@ -255,7 +276,7 @@ async function checkRateLimit(page) {
       if (messageText) chromeText = chromeText.split(messageText).join('\n');
     }
     return chromeText;
-  }, '[data-message-author-role]').catch(() => '');
+  }, '[data-message-author-role], [data-chatgpt-search-unit-key]').catch(() => '');
   const match = text.match(RATE_LIMIT_TEXT_RE);
   if (!match) return null;
   return { snippet: match[0].slice(0, 200), waitMs: extractWaitMs(text) };
@@ -398,15 +419,13 @@ async function waitForResponseComplete(page, timeoutMs, baseline) {
     let limited = await checkRateLimit(page);
     if (limited) throw new RateLimitError(limited.snippet, limited.waitMs);
 
-    await stop.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
-
     let prevText = null;
     let lastChangeAt = Date.now();
     let stopHiddenAt = null;
 
     while (Date.now() < deadline) {
       const count = await messages.count().catch(() => 0);
-      const text = await messages.last().innerText().catch(() => '');
+      const text = await lastAssistantMessageText(messages);
       const stopVisible = await stop.isVisible().catch(() => false);
       const isNew = count > baseline.count || (!!text && text !== baseline.text);
       const now = Date.now();
@@ -502,7 +521,7 @@ async function openSession(options = {}) {
         const composer = page.locator(COMPOSER_SELECTOR).first();
         baseline = {
           count: await page.locator(ASSISTANT_MSG_SELECTOR).count().catch(() => 0),
-          text: await page.locator(ASSISTANT_MSG_SELECTOR).last().innerText().catch(() => ''),
+          text: await lastAssistantMessageText(page.locator(ASSISTANT_MSG_SELECTOR)),
         };
 
         try {
