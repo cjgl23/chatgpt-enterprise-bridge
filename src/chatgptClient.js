@@ -8,28 +8,24 @@
  * language, via the HTTP server built on top of this module — can reuse the
  * same, hard-won automation logic instead of re-discovering it.
  *
- * Model selection: on session open we best-effort pick
- *   1. the LATEST model — the first `menuitemradio` in the picker whose
- *      label isn't a known reasoning-tier name (e.g. "GPT-5.6 Sol" today;
- *      the top item tracks whatever is newest, so this needs no hardcoded
- *      model name), and
- *   2. the requested reasoning tier ("Thinking effort" in the current UI).
- *      Callers default to "Instant"; a caller may request Medium or High.
- * As of 2026-09 the picker is a SINGLE flat menu: model choices and
- * reasoning-tier choices are sibling `menuitemradio` items in one group,
- * not a model submenu plus a separate "Intelligence" section (that older,
- * two-step structure this module originally targeted is gone — there is no
- * longer any nested submenu to open). A tier item can also be present but
- * `disabled` — confirmed in production this happens when the account has
+ * Model selection: on session open we choose the requested Thinking effort
+ * first, then open its model list and choose the first GPT model (the top
+ * entry tracks whatever is newest, so no model name is hardcoded). Callers
+ * default to "Instant"; a caller may request Medium or High.
+ * The picker has changed shape several times, so selectLatestModel() handles
+ * each one seen so far: the current "Select ChatGPT model" button with an
+ * effort slider and a simple/advanced view toggle, an effort row that opens
+ * a nested model submenu, and the 2026-09 flat menu where model and tier
+ * choices were sibling `menuitemradio` items. A tier item can also be present
+ * but `disabled` — confirmed in production this happens when the account has
  * hit its ChatGPT usage limit, not because of a selector mismatch — so that
- * case is detected and reported with its own explicit error rather than
- * timing out on an unclickable element.
- * The ChatGPT DOM changes over time, so the latest-model pick is fail-soft:
- * if a selector no longer matches, we log and continue with whatever model
- * the account has selected — a usable answer from the default model beats a
- * failed run. Reasoning-tier selection for Medium/High remains hard-fail
- * (see selectLatestModel below) so a run never silently misrepresents which
- * tier actually produced a document.
+ * case is reported with its own explicit error rather than timing out on an
+ * unclickable element.
+ * The model pick is fail-soft: if a selector no longer matches, we log and
+ * continue with whatever model the account has selected — a usable answer
+ * from the default model beats a failed run. Reasoning-tier selection for
+ * Medium/High remains hard-fail (see selectLatestModel below) so a run never
+ * silently misrepresents which tier actually produced a document.
  *
  * Requests are strictly SEQUENTIAL over a single page: the web UI is one
  * conversation at a time, and parallel tabs invite rate limiting.
@@ -157,46 +153,59 @@ const STUCK_QUIET_MS = Number(process.env.CHATGPT_STUCK_QUIET_MS || 20000);
 
 const COMPOSER_SELECTOR = '#prompt-textarea, form div[contenteditable="true"]';
 const LOGIN_SELECTOR = '[data-testid="login-button"], [data-testid="welcome-login-button"], button:has-text("Log in")';
-const SEND_SELECTOR = '[data-testid="send-button"], button[aria-label="Send prompt"], form[data-chatgpt-composer] button[type="submit"][aria-label="Send"]';
+const SEND_SELECTOR = '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
 const STOP_SELECTOR = '[data-testid="stop-button"], button[aria-label="Stop streaming"], button[aria-label*="Stop"]';
-// The current ChatGPT UI (2026-09) uses search-unit keys instead of the old
-// author-role attribute. Keep both selectors so saved conversations and older
-// UI variants still work.
-const ASSISTANT_MSG_SELECTOR = '[data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"]';
+const ASSISTANT_MSG_SELECTOR = '[data-message-author-role="assistant"], [data-turn="assistant"], [data-role="assistant"], [data-testid="assistant-message"], [data-markdown-text-style="assistant-message"]';
+const CHAT_MESSAGE_SELECTOR = '[data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-markdown-text-style], [data-message-author-role], [data-turn="assistant"], [data-turn="user"], [data-role="assistant"], [data-role="user"], [data-testid^="conversation-turn-"]';
 
-function assistantMessageText(message) {
-  // The search unit includes a visible "ChatGPT said:" label. Return only the
-  // reply body, which callers may parse as JSON. Legacy messages have no
-  // markdown-text-style descendant and retain their original innerText.
-  const markdown = message.querySelectorAll('[data-markdown-text-style="assistant-message"]');
-  if (markdown.length) return Array.from(markdown, el => el.innerText || '').join('\n').trim();
-  if (message.hasAttribute('data-chatgpt-search-unit-key')) return '';
-  return (message.innerText || '').trim();
+// Use the same reader for baselines, polling and diagnostics. A turn wrapper
+// and its legacy message child can both match; count each turn only once and
+// read its content rather than its copy/share/feedback controls.
+function assistantSnapshotInDocument(selector) {
+  const seen = new Set();
+  const messages = [];
+  for (const el of document.querySelectorAll(selector)) {
+    const turn = el.closest('[data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-testid^="conversation-turn-"], article') || el;
+    if (turn.matches('[data-turn="user"], [data-role="user"]') ||
+        el.closest('[data-message-author-role="user"]')) continue;
+    if (seen.has(turn)) continue;
+    seen.add(turn);
+    const content = turn.querySelector('[data-message-author-role="assistant"], [data-testid="assistant-message"], [data-markdown-text-style="assistant-message"], .markdown') || el;
+    // A reply can be split across several sibling markdown blocks with no
+    // legacy wrapper around them; reading only the first would hand back a
+    // truncated reply. Join the top-level ones.
+    const md = '[data-markdown-text-style="assistant-message"]';
+    const blocks = content.matches(md)
+      ? Array.from(turn.querySelectorAll(md)).filter(block => !block.parentElement.closest(md))
+      : [];
+    messages.push((blocks.length ? blocks : [content]).map(block => (block.innerText || '').trim()).join('\n').trim());
+  }
+  return { count: messages.length, text: messages.at(-1) || '' };
 }
 
-async function lastAssistantMessageText(messages) {
-  return messages.last().evaluate(assistantMessageText).catch(() => '');
+async function readAssistantSnapshot(page) {
+  return page.evaluate(assistantSnapshotInDocument, ASSISTANT_MSG_SELECTOR);
 }
 // Confirmed in production (2026-09): the composer's "Add files and more"
 // button (`data-testid="composer-plus-btn"`) ALSO carries `aria-haspopup="menu"`
-// and sits earlier in DOM order than the reasoning-tier picker button — so a
-// bare `form button[aria-haspopup="menu"]` fallback's `.first()` can silently
-// click the wrong button (the attach-file menu, not the picker).
-// `:not([data-testid="composer-plus-btn"])` excludes it. This selector is now
-// only a fallback: openPicker() below tries the "Thinking effort" keyboard
-// shortcut (Ctrl+Shift+M, shown in the button's own tooltip) first, since a
-// keyboard shortcut is not tied to which button DOM order puts first.
-const MODEL_PICKER_SELECTOR = '[data-testid="model-switcher-dropdown-button"], button[aria-label*="Model selector"], form button[aria-haspopup="menu"]:not([data-testid="composer-plus-btn"])';
-const MENU_SELECTOR = '[role="menu"]';
+// and sits earlier in DOM order than the reasoning-tier picker button — so the
+// old bare `form button[aria-haspopup="menu"]` fallback's `.first()` silently
+// clicked the wrong button (the attach-file menu, not the picker), and the
+// picker never opened. `:not([data-testid="composer-plus-btn"])` excludes it.
+// This is now only a fallback: openPicker() prefers the current dedicated
+// model button, then the keyboard shortcut, before trying these legacy selectors.
+const MODEL_PICKER_SELECTOR = '[data-testid="model-switcher-dropdown-button"], button[aria-label*="Model selector"], button[aria-label="Select ChatGPT model"], form button[aria-haspopup="menu"]:not([data-testid="composer-plus-btn"]), button[aria-label*="Thinking effort"]';
+const MENU_SELECTOR = ':is([role="menu"], [data-radix-popper-content-wrapper]):visible';
 // Wrapped in :is(...) so a suffix appended by string concatenation (e.g.
 // `${MENU_ITEM_SELECTOR}[aria-haspopup="menu"]`) applies to BOTH roles.
 // Without the :is() wrapper, concatenating a comma-separated selector list
 // with a suffix only binds the suffix to the last comma-branch — the first
-// branch silently loses the filter and matches far too broadly.
-// `:not([data-trailing-button])` and `:visible` additionally exclude nested
-// per-row trailing icon buttons that also carry role="menuitem"
+// branch silently loses the filter and matches far too broadly (this bit us:
+// see chatgptClient bugfix history). `:not([data-trailing-button])` and
+// `:visible` additionally exclude nested per-row trailing icon buttons (e.g.
+// a "Pro effort options" control) that also carry role="menuitem"
 // aria-haspopup="menu" but are hidden until their parent row is hovered.
-const MENU_ITEM_SELECTOR = ':is([role="menuitem"], [role="menuitemradio"]):not([data-trailing-button]):visible';
+const MENU_ITEM_SELECTOR = ':is([role="menuitem"], [role="menuitemradio"]):not([data-trailing-button]):not([inert] *):not([aria-hidden="true"] *):visible';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -211,20 +220,19 @@ function sessionExpiredError() {
 // otherwise-opaque failure. Never throws: diagnostics must not mask the real
 // error.
 async function capturePageDiagnostics(page) {
-  const diag = await page.evaluate((selector) => {
-    const assistantEls = document.querySelectorAll(selector);
-    const last = assistantEls[assistantEls.length - 1];
-    const markdown = last?.querySelectorAll('[data-markdown-text-style="assistant-message"]') || [];
-    const lastText = markdown.length
-      ? Array.from(markdown, el => el.innerText || '').join('\n').trim()
-      : last?.hasAttribute('data-chatgpt-search-unit-key') ? '' : (last?.innerText || '').trim();
-    return {
-      title: document.title,
-      bodySnippet: (document.body && document.body.innerText || '').trim().slice(0, 500),
-      assistantMessageCount: assistantEls.length,
-      lastAssistantMessage: last ? lastText.slice(0, 1500) : null,
-    };
-  }, ASSISTANT_MSG_SELECTOR).catch(err => ({ evalError: (err && err.message) || String(err) }));
+  const snapshot = await readAssistantSnapshot(page).catch(() => ({ count: 0, text: '' }));
+  const diag = await page.evaluate(() => ({
+    title: document.title,
+    bodySnippet: (document.body && document.body.innerText || '').trim().slice(0, 500),
+    turnAttributes: Array.from(document.querySelectorAll('[data-content-search-unit-key], article, [data-testid^="conversation-turn-"]')).slice(-4).map(el => ({
+      role: el.getAttribute('data-message-author-role'), turn: el.getAttribute('data-turn'),
+      dataRole: el.getAttribute('data-role'), testId: el.getAttribute('data-testid'),
+      searchUnit: el.getAttribute('data-content-search-unit-key'),
+      hasAssistantMarkdown: !!el.querySelector('[data-markdown-text-style="assistant-message"]'),
+    })),
+  })).catch(err => ({ evalError: (err && err.message) || String(err) }));
+  diag.assistantMessageCount = snapshot.count;
+  diag.lastAssistantMessage = snapshot.text.slice(0, 1500) || null;
   return { url: page.url(), ...diag };
 }
 
@@ -276,7 +284,7 @@ async function checkRateLimit(page) {
       if (messageText) chromeText = chromeText.split(messageText).join('\n');
     }
     return chromeText;
-  }, '[data-message-author-role], [data-chatgpt-search-unit-key]').catch(() => '');
+  }, CHAT_MESSAGE_SELECTOR).catch(() => '');
   const match = text.match(RATE_LIMIT_TEXT_RE);
   if (!match) return null;
   return { snippet: match[0].slice(0, 200), waitMs: extractWaitMs(text) };
@@ -285,17 +293,6 @@ async function checkRateLimit(page) {
 /** Is a saved ChatGPT Enterprise session available? (cheap, no browser) */
 function isAvailable() {
   return chatgptSessionExists();
-}
-
-// Reasoning-tier labels that can appear as menuitemradio siblings of the
-// model choices in today's single flat picker menu. Used to tell "this radio
-// is a model" apart from "this radio is a tier" now that both live in the
-// same group with no structural (role/nesting) difference between them —
-// only the label text distinguishes them. Kept lowercase for comparison.
-const KNOWN_TIER_LABELS = ['instant', 'medium', 'high', 'extra high', 'pro'];
-
-function isKnownTierLabel(text) {
-  return KNOWN_TIER_LABELS.includes(text.trim().toLowerCase());
 }
 
 /**
@@ -307,10 +304,16 @@ async function selectLatestModel(page, thinkingLevel = 'instant') {
   const requestedLevel = validateThinkingLevel(thinkingLevel);
   const requestedLabel = thinkingLevelLabel(requestedLevel);
   const openPicker = async () => {
-    // Primary: the "Thinking effort" keyboard shortcut. Robust against DOM
-    // changes because it doesn't depend on which button matches a selector
-    // first — see MODEL_PICKER_SELECTOR's comment for the exact failure this
-    // sidesteps.
+    // Current composer exposes a dedicated model button. Prefer it to the
+    // shortcut, which can open a different picker view. Older UIs fall back
+    // to the shortcut and then the legacy composer selector.
+    const currentPicker = page.getByRole('button', { name: 'Select ChatGPT model', exact: true });
+    if (await currentPicker.count()) {
+      await currentPicker.click({ timeout: 8000 });
+      await page.locator(MENU_SELECTOR).first().waitFor({ state: 'visible', timeout: 8000 });
+      await sleep(400);
+      return;
+    }
     try {
       await page.keyboard.press('Control+Shift+M');
       await page.locator(MENU_SELECTOR).first().waitFor({ state: 'visible', timeout: 3000 });
@@ -326,71 +329,89 @@ async function selectLatestModel(page, thinkingLevel = 'instant') {
     try { await page.keyboard.press('Escape'); await sleep(300); } catch (_) {}
   };
 
-  // Pass 1: latest model = first menuitemradio in the picker whose label is
-  // NOT a known reasoning-tier name. There is no longer a nested submenu to
-  // open (see module header) — model and tier choices are flat siblings in
-  // one group, so the "first item" a caller cares about is simply the first
-  // one whose label isn't "Instant"/"Medium"/etc.
+  // Pass 1: select the requested reasoning tier by its visible label. Label
+  // matching is more robust than relying on menu position now that callers
+  // can request Medium or High.
+  //
+  // The label is anchored to the START of the item's text — not just a
+  // word-boundary match — because "High" is a substring of "Extra High" and
+  // an unanchored/word-boundary regex would match both. But the anchor must
+  // tolerate leading non-letter noise (a checkmark glyph or visually-hidden
+  // "Selected" text ahead of the label in DOM order for the currently-active
+  // tier, which need not match its visual position) — confirmed in
+  // production: a request for "Instant" failed to match even though it was
+  // the checked/current item in the picker.
   try {
     await openPicker();
-    const radios = page.locator(`${MENU_SELECTOR} [role="menuitemradio"]`);
-    const radioCount = await radios.count();
-    let modelItem = null;
-    let modelLabelText = '';
-    for (let i = 0; i < radioCount; i++) {
-      const item = radios.nth(i);
-      const text = (await item.innerText().catch(() => '')).split('\n')[0].trim();
-      if (text && !isKnownTierLabel(text)) {
-        modelItem = item;
-        modelLabelText = text;
-        break;
-      }
+    // Committing the current model closes its list view. A checked item
+    // still needs its selection callback; Escape alone preserves that view.
+    const pickerView = page.locator('[data-model-picker-view]:visible').last();
+    if (await pickerView.count() && await pickerView.getAttribute('data-model-picker-view') === 'advanced') {
+      await page.locator(`${MENU_SELECTOR} [role="menuitemradio"][aria-checked="true"]:not([inert] *):visible`).first().click({ timeout: 5000 });
+      await closePicker();
+      await openPicker();
     }
-    if (modelItem) {
-      const alreadySelected = (await modelItem.getAttribute('aria-checked').catch(() => null)) === 'true';
-      if (!alreadySelected) {
-        await modelItem.click({ timeout: 5000 });
-        await sleep(400);
+    const slider = page.locator(':is([data-reasoning-slider="true"], [role="slider"]):not([inert] *):not([aria-hidden="true"] *)').first();
+    if (await slider.count() && (await slider.getAttribute('data-reasoning-slider') || await slider.isVisible())) {
+      await slider.focus();
+      if (await slider.getAttribute('data-reasoning-slider')) {
+        for (let i = 0; i < 10; i++) await slider.press('ArrowLeft');
+      } else {
+        await slider.press('Home');
       }
-      log.info({ 'event.action': 'chatgpt.model.selected', labels: { model: modelLabelText, alreadySelected } }, 'Selected latest ChatGPT model');
+      await sleep(150);
+      // Discover the label at each slider position; do not hardcode indexes
+      // because workspaces expose different effort ranges (including Low).
+      let matched = false;
+      for (let i = 0; i < 10; i++) {
+        const selected = await slider.getAttribute('aria-valuetext');
+        const effortLabel = page.locator('[data-effort-only="true"]:visible').first();
+        const visibleLabel = await effortLabel.count() ? await effortLabel.innerText()
+          : await page.locator(MENU_SELECTOR).filter({ has: slider }).last().innerText();
+        if (intelligenceLabelPattern(requestedLabel).test(selected || visibleLabel.trim())) {
+          matched = true;
+          break;
+        }
+        const before = await slider.getAttribute('aria-valuenow');
+        await slider.press('ArrowRight');
+        await sleep(150);
+        if (before !== null && before === await slider.getAttribute('aria-valuenow')) break;
+      }
+      if (!matched) throw new Error(`Could not verify ${requestedLabel} in the Thinking effort slider.`);
+      log.info({ 'event.action': 'chatgpt.intelligence.selected', labels: { intelligence: requestedLabel } }, 'Selected requested reasoning tier');
     } else {
-      log.warn({ 'event.action': 'chatgpt.model.select.skipped' }, 'No model choice found in picker — continuing with the account default');
+      const items = page.locator(`${MENU_SELECTOR} ${MENU_ITEM_SELECTOR}`);
+      const requested = items.filter({ hasText: intelligenceLabelPattern(requestedLabel) }).first();
+      if (!(await requested.count())) {
+        // Diagnostic: log what the picker actually shows so a mismatch here is
+        // fixable from the log alone next time, without needing a screenshot.
+        const available = await items.evaluateAll(els => els.map(el => (el.textContent || '').trim().slice(0, 60))).catch(() => []);
+        throw Object.assign(
+          new Error(`${requestedLabel} is not available in this workspace's ChatGPT model picker.`),
+          { availableLabels: available }
+        );
+      }
+      // Confirmed in production: a tier can be PRESENT in the menu but
+      // `disabled` — this happens when the ChatGPT account/workspace has hit
+      // its usage limit, not because of a stale selector. Detect this
+      // explicitly so the failure is actionable (upgrade/wait for reset)
+      // rather than reading as a generic timeout from clicking an unclickable
+      // element.
+      const isDisabled = await requested.evaluate(
+        el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'
+      ).catch(() => false);
+      if (isDisabled) {
+        throw new Error(
+          `${requestedLabel} is shown in the ChatGPT picker but is disabled — this is usually the account/workspace `
+          + `usage limit ("Usage limit reached" banner in the ChatGPT UI), not a bug. Wait for the limit to reset, or `
+          + `use a lower tier, then try again.`
+        );
+      }
+      const label = (await requested.innerText().catch(() => requestedLabel)).split('\n')[0].trim();
+      await requested.click({ timeout: 5000 });
+      log.info({ 'event.action': 'chatgpt.intelligence.selected', labels: { intelligence: label } }, 'Selected requested reasoning tier');
+      await sleep(400);
     }
-    await closePicker();
-  } catch (err) {
-    log.warn({ err, 'event.action': 'chatgpt.model.select.failed' }, 'Could not select latest model — continuing with the account default');
-    await closePicker();
-  }
-
-  // Pass 2: select the requested reasoning tier by its visible label.
-  try {
-    await openPicker();
-    const items = page.locator(`${MENU_SELECTOR} ${MENU_ITEM_SELECTOR}`);
-    const requested = items.filter({ hasText: intelligenceLabelPattern(requestedLabel) }).first();
-    if (!(await requested.count())) {
-      const available = await items.evaluateAll(els => els.map(el => (el.textContent || '').trim().slice(0, 60))).catch(() => []);
-      throw Object.assign(
-        new Error(`${requestedLabel} is not available in this workspace's ChatGPT model picker.`),
-        { availableLabels: available }
-      );
-    }
-    // Confirmed in production: a tier can be PRESENT in the menu but
-    // `disabled` — this happens when the ChatGPT account/workspace has hit
-    // its usage limit, not because of a stale selector.
-    const isDisabled = await requested.evaluate(
-      el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'
-    ).catch(() => false);
-    if (isDisabled) {
-      throw new Error(
-        `${requestedLabel} is shown in the ChatGPT picker but is disabled — this is usually the account/workspace `
-        + `usage limit ("Usage limit reached" banner in the ChatGPT UI), not a bug. Wait for the limit to reset, or `
-        + `use a lower tier, then try again.`
-      );
-    }
-    const label = (await requested.innerText().catch(() => requestedLabel)).split('\n')[0].trim();
-    await requested.click({ timeout: 5000 });
-    log.info({ 'event.action': 'chatgpt.intelligence.selected', labels: { intelligence: label } }, 'Selected requested reasoning tier');
-    await sleep(400);
   } catch (err) {
     log.warn(
       { err, 'event.action': 'chatgpt.intelligence.select.failed', labels: { requestedLevel, availableLabels: err.availableLabels || [] } },
@@ -399,8 +420,51 @@ async function selectLatestModel(page, thinkingLevel = 'instant') {
     await closePicker();
     // Instant retains the historical fail-soft behavior. Medium/High are an
     // explicit quality choice, so silently continuing at another level would
-    // misrepresent the generated documents to the caller.
+    // misrepresent the generated documents to the user.
     if (requestedLevel !== 'instant') throw err;
+  }
+  // Choose the model AFTER effort: the current UI nests models beneath
+  // the effort label. Keep the flat radio-list path for older workspaces.
+  try {
+    if (!(await page.locator(MENU_SELECTOR).count())) await openPicker();
+    const submenu = page.locator(`${MENU_SELECTOR} ${MENU_ITEM_SELECTOR}`).filter({ hasText: intelligenceLabelPattern(requestedLabel) }).first();
+    const effortButton = page.locator(MENU_SELECTOR).getByRole('button', { name: intelligenceLabelPattern(requestedLabel) }).last();
+    const viewToggle = page.locator('[data-model-picker-view-toggle="true"]:not([inert] *):not([aria-hidden="true"] *):visible').first();
+    const advancedView = page.locator('[data-model-picker-view="advanced"]:visible');
+    if (!(await advancedView.count()) && await viewToggle.count()) {
+      await viewToggle.focus();
+      await viewToggle.press('Enter');
+      await sleep(300);
+    } else if (!(await advancedView.count()) && await submenu.count() && await submenu.getAttribute('aria-haspopup')) {
+      await submenu.click({ timeout: 5000 });
+    } else if (!(await advancedView.count()) && await effortButton.isVisible().catch(() => false)) {
+      await effortButton.click({ timeout: 5000 });
+    }
+    const radios = page.locator(MENU_SELECTOR).locator(`${MENU_ITEM_SELECTOR}, button:not([inert] *):not([aria-hidden="true"] *):visible`);
+    const radioCount = await radios.count();
+    let modelItem = null;
+    let modelLabelText = '';
+    for (let i = 0; i < radioCount; i++) {
+      const item = radios.nth(i);
+      const text = (await item.innerText().catch(() => '')).split('\n')[0].trim();
+      if (/^GPT[-\s]/i.test(text)) {
+        modelItem = item;
+        modelLabelText = text;
+        break;
+      }
+    }
+    if (modelItem) {
+      const alreadySelected = (await modelItem.getAttribute('aria-checked').catch(() => null)) === 'true';
+      await modelItem.click({ timeout: 5000 });
+      await sleep(400);
+      log.info({ 'event.action': 'chatgpt.model.selected', labels: { model: modelLabelText, alreadySelected } }, 'Selected latest ChatGPT model');
+    } else {
+      log.warn({ 'event.action': 'chatgpt.model.select.skipped' }, 'No model choice found in picker — continuing with the account default');
+    }
+    await closePicker();
+  } catch (err) {
+    log.warn({ err, 'event.action': 'chatgpt.model.select.failed' }, 'Could not select latest model — continuing with the account default');
+    await closePicker();
   }
 }
 
@@ -413,24 +477,54 @@ async function waitForResponseComplete(page, timeoutMs, baseline) {
 
   async function poll() {
     const stop = page.locator(STOP_SELECTOR).first();
-    const messages = page.locator(ASSISTANT_MSG_SELECTOR);
 
+
+    // A rate-limit toast can appear immediately after send, before any reply
+    // starts streaming — give it a moment to render, then check.
     await sleep(500);
     let limited = await checkRateLimit(page);
     if (limited) throw new RateLimitError(limited.snippet, limited.waitMs);
 
+    // Best-effort: confirm generation actually started before polling for
+    // its end. If the stop button never appears within 15s — a fast reply,
+    // DOM drift on this selector, or a rate limit that replaced the normal
+    // flow entirely — fall straight through to the completion poll rather
+    // than blocking here; that poll checks for a rate limit on every
+    // iteration too.
+    await stop.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+
+    // Every poll first establishes NEWNESS, then applies the two done-signals
+    // above. Newness exists because in a reused conversation `.last()` points
+    // at the PREVIOUS turn's already-finished reply until the new bubble
+    // mounts — returning that would hand back a complete, well-formed answer
+    // belonging to a different cluster's prompt (confirmed in production).
+    //
+    // Newness is satisfied by EITHER a grown message count OR the last
+    // message's text differing from what was there before we sent. Counting
+    // alone is not enough: ChatGPT virtualizes long conversations, so an old
+    // bubble can unmount as the new one mounts, leaving the count flat
+    // forever. A count-only gate then blocks until the full timeout while the
+    // answer is plainly visible in the browser — confirmed in production, with
+    // the reply captured intact in this run's own retry diagnostics.
+    // Completion is decided on how long the text has been QUIET, not on a
+    // fixed number of consecutive equal polls. Poll-count comparisons capture
+    // truncated replies: a mid-stream pause longer than the poll interval
+    // makes two consecutive reads match while the model is still writing.
+    // Confirmed in production — a run where the only change was this gate
+    // opening earlier went from 1 to 6 unparseable (truncated) replies.
     let prevText = null;
     let lastChangeAt = Date.now();
     let stopHiddenAt = null;
 
     while (Date.now() < deadline) {
-      const count = await messages.count().catch(() => 0);
-      const text = await lastAssistantMessageText(messages);
+      const { count, text } = await readAssistantSnapshot(page);
       const stopVisible = await stop.isVisible().catch(() => false);
       const isNew = count > baseline.count || (!!text && text !== baseline.text);
       const now = Date.now();
 
       if (!isNew || !text) {
+        // Still looking at the previous turn's reply — do not let its
+        // (already stable) text start the quiet clock.
         prevText = null;
         lastChangeAt = now;
         stopHiddenAt = null;
@@ -441,10 +535,19 @@ async function waitForResponseComplete(page, timeoutMs, baseline) {
         }
         if (stopVisible) {
           stopHiddenAt = null;
+          // Rescue for reasoning-style models that keep a "thinking" control
+          // on screen long after the visible answer is finished: accept the
+          // reply once it has been completely unchanged for STUCK_QUIET_MS.
           if (now - lastChangeAt >= STUCK_QUIET_MS) return text;
         } else {
           if (stopHiddenAt === null) stopHiddenAt = now;
+          // Normal path: streaming control gone AND the text has stopped
+          // changing for QUIET_MS, so trailing tokens have flushed.
           if (now - lastChangeAt >= QUIET_MS) return text;
+          // Backstop for cosmetic DOM churn that never lets the full quiet
+          // window elapse. It still REQUIRES a quiet window, just a shorter
+          // one — never a bare timer, which would fire mid-stream and
+          // capture a partial reply.
           if (now - stopHiddenAt >= STOP_HIDDEN_MAX_MS && now - lastChangeAt >= RELAXED_QUIET_MS) return text;
         }
       }
@@ -519,10 +622,7 @@ async function openSession(options = {}) {
         batchesSinceNewChat = (batchesSinceNewChat + 1) % BATCHES_PER_CONVERSATION;
 
         const composer = page.locator(COMPOSER_SELECTOR).first();
-        baseline = {
-          count: await page.locator(ASSISTANT_MSG_SELECTOR).count().catch(() => 0),
-          text: await lastAssistantMessageText(page.locator(ASSISTANT_MSG_SELECTOR)),
-        };
+        baseline = await readAssistantSnapshot(page);
 
         try {
           await composer.click({ timeout: 10000 });
@@ -624,6 +724,10 @@ async function gotoNewChat(page) {
 
 module.exports = {
   isAvailable,
+  assistantSnapshotInDocument,
+  readAssistantSnapshot,
+  waitForResponseComplete,
+  selectLatestModel,
   openSession,
   isSessionExpiredError,
   isRateLimitError,
