@@ -3,12 +3,16 @@ const assert = require('node:assert/strict');
 
 const chatgpt = require('../src/chatgptClient');
 
+test('sessions are pinned to GPT-5.6 Sol unless CHATGPT_MODEL overrides it', () => {
+  assert.equal(chatgpt.PINNED_MODEL, process.env.CHATGPT_MODEL || 'GPT-5.6 Sol');
+});
+
 test('ChatGPT thinking-level helpers preserve Instant as the default', () => {
   assert.equal(chatgpt.validateThinkingLevel(), 'instant');
   assert.equal(chatgpt.thinkingLevelLabel(), 'Instant');
-  assert.equal(chatgpt.modelLabel(), 'ChatGPT Enterprise (latest model, Instant)');
-  assert.equal(chatgpt.modelLabel('medium'), 'ChatGPT Enterprise (latest model, Medium)');
-  assert.equal(chatgpt.modelLabel('HIGH'), 'ChatGPT Enterprise (latest model, High)');
+  assert.equal(chatgpt.modelLabel(), `ChatGPT Enterprise (${chatgpt.PINNED_MODEL}, Instant)`);
+  assert.equal(chatgpt.modelLabel('medium'), `ChatGPT Enterprise (${chatgpt.PINNED_MODEL}, Medium)`);
+  assert.equal(chatgpt.modelLabel('HIGH'), `ChatGPT Enterprise (${chatgpt.PINNED_MODEL}, High)`);
   assert.throws(() => chatgpt.validateThinkingLevel('pro'), /Instant, Medium, or High/);
 });
 
@@ -120,4 +124,22 @@ test('response reader joins a reply split across sibling markdown blocks', () =>
   const turn = messageNode('ChatGPT said: first block second block Copy', { content: blocks[0] });
   turn.querySelectorAll = () => blocks;
   assert.deepEqual(snapshot([turn]), { count: 1, text: 'first block\nsecond block' });
+});
+
+function turnComplete(nodes) {
+  const previous = global.document;
+  global.document = { querySelectorAll: () => nodes };
+  try { return chatgpt.lastAssistantTurnCompleteInDocument('fixture'); }
+  finally {
+    if (previous === undefined) delete global.document;
+    else global.document = previous;
+  }
+}
+
+test('turn-complete check reads ChatGPT\'s marker on the newest assistant turn only', () => {
+  const inTurn = state => ({ closest: () => (state ? { getAttribute: () => state } : null) });
+  assert.equal(turnComplete([inTurn('complete')]), true);
+  assert.equal(turnComplete([inTurn('complete'), inTurn('streaming')]), false);
+  assert.equal(turnComplete([inTurn(null)]), false);
+  assert.equal(turnComplete([]), false);
 });

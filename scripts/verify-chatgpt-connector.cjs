@@ -1,6 +1,8 @@
 // Optional browser regression checks: node scripts/verify-chatgpt-connector.cjs
 // Uses only local HTML fixtures; no ChatGPT session or network is needed.
 const assert=require('node:assert/strict');
+// Short grace so the blank-reply check below finishes in seconds.
+process.env.CHATGPT_BLANK_REPLY_GRACE_MS = '1000';
 const {launchBrowser}=require('../src/browser');
 const fixtureWarnings = [];
 require('../src/logger').child = () => ({
@@ -43,7 +45,15 @@ const client=require('../src/chatgptClient');
    await client.selectLatestModel(p, effort);
    assert.deepEqual(await p.evaluate(() => window.choices), [client.thinkingLevelLabel(effort), 'GPT-5.6 Sol']);
  }
+ // A finished reply with no text fails fast instead of waiting out the timeout.
+ await p.setContent(`<div data-talvt-turn-state="complete"><div data-turn="assistant"><div data-markdown-text-style="assistant-message"></div></div></div>`);
+ const blankStart = Date.now();
+ await assert.rejects(client.waitForResponseComplete(p, 60000, { count: 0, text: '' }), client.EmptyReplyError);
+ assert.ok(Date.now() - blankStart < 30000, 'blank reply must not wait for the full timeout');
+ // The same empty turn while ChatGPT is still streaming is NOT a blank reply.
+ await p.setContent(`<div data-talvt-turn-state="streaming"><div data-turn="assistant"><div data-markdown-text-style="assistant-message"></div></div></div>`);
+ await assert.rejects(client.waitForResponseComplete(p, 20000, { count: 0, text: '' }), /did not finish responding/);
  assert.deepEqual(fixtureWarnings, [], 'fixture selection must succeed without falling back');
- console.log('PASS: legacy/current response wrappers and native/current effort controls and Instant/Medium/High slider + nested model menu');
+ console.log('PASS: blank-reply detection, legacy/current response wrappers and native/current effort controls and Instant/Medium/High slider + nested model menu');
  }finally{await browser.close()}
 })().catch(e=>{console.error(e);process.exitCode=1});

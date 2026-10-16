@@ -82,8 +82,13 @@ function thinkingLevelLabel(value = 'instant') {
   return level[0].toUpperCase() + level.slice(1);
 }
 
+// The model every session is pinned to. Confirmed in production
+// (2026-10-14/15): GPT-6 (also the "Latest" account default) returned EMPTY
+// replies to the long Amigo tester prompt, while GPT-5.6 Sol answered it.
+const PINNED_MODEL = process.env.CHATGPT_MODEL || 'GPT-5.6 Sol';
+
 function modelLabel(value = 'instant') {
-  return `ChatGPT Enterprise (latest model, ${thinkingLevelLabel(value)})`;
+  return `ChatGPT Enterprise (${PINNED_MODEL}, ${thinkingLevelLabel(value)})`;
 }
 
 /**
@@ -150,6 +155,9 @@ const QUIET_MS = Number(process.env.CHATGPT_QUIET_MS || 2500);
 const STOP_HIDDEN_MAX_MS = Number(process.env.CHATGPT_STOP_HIDDEN_MAX_MS || 30000);
 const RELAXED_QUIET_MS = Number(process.env.CHATGPT_RELAXED_QUIET_MS || 800);
 const STUCK_QUIET_MS = Number(process.env.CHATGPT_STUCK_QUIET_MS || 20000);
+// How long a finished-but-empty reply must stay empty before it is reported
+// as a blank reply instead of waiting out the full request timeout.
+const BLANK_REPLY_GRACE_MS = Number(process.env.CHATGPT_BLANK_REPLY_GRACE_MS || 15000);
 
 const COMPOSER_SELECTOR = '#prompt-textarea, form div[contenteditable="true"]';
 const LOGIN_SELECTOR = '[data-testid="login-button"], [data-testid="welcome-login-button"], button:has-text("Log in")';
@@ -185,6 +193,27 @@ function assistantSnapshotInDocument(selector) {
 
 async function readAssistantSnapshot(page) {
   return page.evaluate(assistantSnapshotInDocument, ASSISTANT_MSG_SELECTOR);
+}
+
+// True when the newest assistant turn carries ChatGPT's own "turn complete"
+// marker. Confirmed in production (2026-10-14): a blank GPT-6 reply ends with
+// this marker and the copy/regenerate controls but no text at all.
+function lastAssistantTurnCompleteInDocument(selector) {
+  const all = document.querySelectorAll(selector);
+  const last = all[all.length - 1];
+  const state = last && last.closest('[data-talvt-turn-state]');
+  return !!state && state.getAttribute('data-talvt-turn-state') === 'complete';
+}
+
+async function isLastAssistantTurnComplete(page) {
+  return page.evaluate(lastAssistantTurnCompleteInDocument, ASSISTANT_MSG_SELECTOR).catch(() => false);
+}
+
+class EmptyReplyError extends Error {
+  constructor() {
+    super('ChatGPT finished its reply without any text (blank reply).');
+    this.name = 'EmptyReplyError';
+  }
 }
 // Confirmed in production (2026-09): the composer's "Add files and more"
 // button (`data-testid="composer-plus-btn"`) ALSO carries `aria-haspopup="menu"`
@@ -296,9 +325,10 @@ function isAvailable() {
 }
 
 /**
- * Best-effort model selection plus explicit reasoning-tier selection. Instant
- * keeps the historical fail-soft picker behavior; a requested Medium/High
+ * Select the reasoning tier, then the pinned model (PINNED_MODEL). Instant
+ * keeps the historical fail-soft tier behavior; a requested Medium/High
  * level throws when unavailable so the run never silently uses a lower tier.
+ * A missing pinned model always throws rather than falling back.
  */
 async function selectLatestModel(page, thinkingLevel = 'instant') {
   const requestedLevel = validateThinkingLevel(thinkingLevel);
@@ -447,7 +477,7 @@ async function selectLatestModel(page, thinkingLevel = 'instant') {
     for (let i = 0; i < radioCount; i++) {
       const item = radios.nth(i);
       const text = (await item.innerText().catch(() => '')).split('\n')[0].trim();
-      if (/^GPT[-\s]/i.test(text)) {
+      if (text.toLowerCase() === PINNED_MODEL.toLowerCase()) {
         modelItem = item;
         modelLabelText = text;
         break;
@@ -457,14 +487,24 @@ async function selectLatestModel(page, thinkingLevel = 'instant') {
       const alreadySelected = (await modelItem.getAttribute('aria-checked').catch(() => null)) === 'true';
       await modelItem.click({ timeout: 5000 });
       await sleep(400);
-      log.info({ 'event.action': 'chatgpt.model.selected', labels: { model: modelLabelText, alreadySelected } }, 'Selected latest ChatGPT model');
+      log.info({ 'event.action': 'chatgpt.model.selected', labels: { model: modelLabelText, alreadySelected } }, 'Selected pinned ChatGPT model');
     } else {
-      log.warn({ 'event.action': 'chatgpt.model.select.skipped' }, 'No model choice found in picker — continuing with the account default');
+      // Never fall back silently: the account default is the model that gave
+      // blank replies, so running on it would just burn every request.
+      const available = await radios.evaluateAll(els => els.map(el => (el.textContent || '').trim().slice(0, 60))).catch(() => []);
+      throw Object.assign(
+        new Error(`${PINNED_MODEL} is not available in this workspace's ChatGPT model picker (set CHATGPT_MODEL to choose another).`),
+        { pinnedModelMissing: true, availableLabels: available }
+      );
     }
     await closePicker();
   } catch (err) {
-    log.warn({ err, 'event.action': 'chatgpt.model.select.failed' }, 'Could not select latest model — continuing with the account default');
+    log.warn(
+      { err, 'event.action': 'chatgpt.model.select.failed', labels: { model: PINNED_MODEL, availableLabels: err.availableLabels || [] } },
+      'Could not select the pinned ChatGPT model'
+    );
     await closePicker();
+    throw err;
   }
 }
 
@@ -515,6 +555,7 @@ async function waitForResponseComplete(page, timeoutMs, baseline) {
     let prevText = null;
     let lastChangeAt = Date.now();
     let stopHiddenAt = null;
+    let blankSince = null;
 
     while (Date.now() < deadline) {
       const { count, text } = await readAssistantSnapshot(page);
@@ -528,6 +569,12 @@ async function waitForResponseComplete(page, timeoutMs, baseline) {
         prevText = null;
         lastChangeAt = now;
         stopHiddenAt = null;
+        // A new turn that ChatGPT has already marked complete but which holds
+        // no text will never fill in; fail fast rather than burn the timeout.
+        const blankDone = count > baseline.count && !text && !stopVisible && await isLastAssistantTurnComplete(page);
+        if (!blankDone) blankSince = null;
+        else if (blankSince === null) blankSince = now;
+        else if (now - blankSince >= BLANK_REPLY_GRACE_MS) throw new EmptyReplyError();
       } else {
         if (text !== prevText) {
           prevText = text;
@@ -726,7 +773,9 @@ module.exports = {
   isAvailable,
   assistantSnapshotInDocument,
   readAssistantSnapshot,
+  lastAssistantTurnCompleteInDocument,
   waitForResponseComplete,
+  EmptyReplyError,
   selectLatestModel,
   openSession,
   isSessionExpiredError,
@@ -738,6 +787,7 @@ module.exports = {
   requestTimeoutFor,
   THINKING_LEVELS,
   MODEL_LABEL,
+  PINNED_MODEL,
   BASE_URL,
   REQUEST_TIMEOUT_MS,
 };
