@@ -1,0 +1,20 @@
+{
+  "name": "chatgpt-enterprise-bridge",
+  "version": "0.1.0",
+  "description": "Local HTTP service that drives a saved ChatGPT Enterprise browser session (Playwright) so apps in any language can use it via plain HTTP, on Windows or Mac.",
+  "license": "MIT",
+  "main": "src/server.js",
+  "bin": {
+    "chatgpt-enterprise-bridge": "bin/start.js"
+  },
+  "scripts": {
+    "start": "node bin/start.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
+    "playwright": "^1.65.0"
+  }
+}

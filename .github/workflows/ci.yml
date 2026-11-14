@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: cjgl23/github-workflows/.github/workflows/ci.yml@b25f7e44fd55ce5efd4c57175557e00789d64070
+    with:
+      project-type: auto
